@@ -3,13 +3,16 @@ import sys
 import time
 import json
 import re
-import requests
+import cloudscraper
+import requests.cookies
 import zipfile
 import rarfile
-import threading
-import itertools
 import inquirer
+import img2pdf
+import shutil
+import tempfile
 from pathlib import Path
+from PIL import Image
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -33,7 +36,13 @@ ENDC = '\033[0m'
 SEPARATOR = f"\n{GREY}────────────────────────────────────────────────────────────{ENDC}"
 
 def clear_console():
-    os.system('cls' if os.name == 'nt' else 'clear')
+    # Use ANSI escape codes for better compatibility with inquirer
+    # \033[2J - Clear entire screen
+    # \033[H - Move cursor to home position (top-left)
+    if os.name == 'nt':
+        os.system('cls')
+    else:
+        print('\033[2J\033[H', end='', flush=True)
 
 def print_menu():
     title = f"{MAGENTA_BG}{BLACK_FG}{BOLD} COM-X.LIFE Downloader{ENDC}"
@@ -41,9 +50,13 @@ def print_menu():
     print(f"\n{title}  {author}\n")
 
 class ComXLifeDownloader:
-    def __init__(self, browser_choice='chrome'):
+    def __init__(self, browser_choice='chrome', debug=False):
+        self.debug = debug
         self.base_url = "https://com-x.life"
-        self.session = requests.Session()
+        self.session = cloudscraper.create_scraper(
+            browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+            delay=1
+        )
         self.cookies = {}
         self.browser_choice = browser_choice
         self.headers = {
@@ -96,7 +109,11 @@ class ComXLifeDownloader:
                         cookies_list = driver.get_cookies()
                         for cookie in cookies_list:
                             self.cookies[cookie['name']] = cookie['value']
-                            self.session.cookies.set(cookie['name'], cookie['value'])
+                        # Create a new cookie jar to completely replace session cookies (avoids duplicates)
+                        new_jar = requests.cookies.RequestsCookieJar()
+                        for name, value in self.cookies.items():
+                            new_jar.set(name, value, domain='com-x.life')
+                        self.session.cookies = new_jar
                         if self.cookies:
                             self.save_cookies()
                             print(f"✓ Получено {len(self.cookies)} cookies\n")
@@ -106,7 +123,7 @@ class ComXLifeDownloader:
                             return False
                     time.sleep(1)
                 except Exception:
-                    print(f"\n✗ Браузер был закрыт пользователем до завершения авторизации.")
+                    print("\n✗ Браузер был закрыт пользователем до завершения авторизации.")
                     return False
         except Exception as e:
             print(f"✗ Ошибка во время ожидания авторизации: {e}")
@@ -114,7 +131,7 @@ class ComXLifeDownloader:
         finally:
             try:
                 driver.quit()
-            except:
+            except Exception:
                 pass
         return False
 
@@ -130,11 +147,14 @@ class ComXLifeDownloader:
             try:
                 with open(cookies_file, 'r', encoding='utf-8') as f:
                     self.cookies = json.load(f)
+                    # Create a new cookie jar to completely replace session cookies (avoids duplicates)
+                    new_jar = requests.cookies.RequestsCookieJar()
                     for name, value in self.cookies.items():
-                        self.session.cookies.set(name, value)
-                print(f"✓ Cookies загружены из файла")
+                        new_jar.set(name, value, domain='com-x.life')
+                    self.session.cookies = new_jar
+                print("✓ Cookies загружены из файла")
                 return True
-            except:
+            except Exception:
                 pass
         return False
 
@@ -149,13 +169,16 @@ class ComXLifeDownloader:
             encoded_query = quote(query)
             search_url = f"{self.base_url}/search/{encoded_query}/page/{page}/" if page > 1 else f"{self.base_url}/search/{encoded_query}"
             response = self.session.get(search_url, headers=self.headers)
-            if response.status_code != 200: return []
+            if response.status_code != 200:
+                return []
             soup = BeautifulSoup(response.content, 'lxml')
             content = soup.find('div', id='dle-content')
-            if not content: return []
+            if not content:
+                return []
             results = []
             title_tags = content.find_all('h3', class_='readed__title')
-            if not title_tags: return []
+            if not title_tags:
+                return []
             for title_tag in title_tags:
                 if title_tag.a:
                     title = title_tag.a.text.strip()
@@ -241,7 +264,10 @@ class ComXLifeDownloader:
         # ========================================================================
         # === ИЗМЕНЕНИЕ (v5.9): Убран Spinner ===
         # ========================================================================
-        print(f"  🔗 Скачиваю: {chapter_title_safe}...", end="", flush=True)
+        if self.debug:
+            print(f"  🔗 Скачиваю: {chapter_title_safe}...")
+        else:
+            print(f"  🔗 Скачиваю: {chapter_title_safe}...", end="", flush=True)
 
         try:
             api_url = f"{self.base_url}/engine/ajax/controller.php?mod=api&action=chapters/download"
@@ -258,7 +284,10 @@ class ComXLifeDownloader:
 
             if link_resp.status_code != 200:
                 time_taken_s = f"({time.time() - start_time:.2f} сек)"
-                print(f"\r  ✗ Ошибка API: {link_resp.status_code} для [#{chapter_posi}] {time_taken_s}")
+                if self.debug:
+                    print(f"  ✗ Ошибка API: {link_resp.status_code} для [#{chapter_posi}] {time_taken_s}")
+                else:
+                    print(f"\r  ✗ Ошибка API: {link_resp.status_code} для [#{chapter_posi}] {time_taken_s}")
                 return False
 
             json_data = link_resp.json()
@@ -266,15 +295,33 @@ class ComXLifeDownloader:
 
             if not raw_url:
                 time_taken_s = f"({time.time() - start_time:.2f} сек)"
-                print(f"\r  ✗ API не вернул ссылку для [#{chapter_posi}] (error: {json_data.get('error')}) {time_taken_s}")
+                if self.debug:
+                    print(f"  ✗ API не вернул ссылку для [#{chapter_posi}] (error: {json_data.get('error')}) {time_taken_s}")
+                else:
+                    print(f"\r  ✗ API не вернул ссылку для [#{chapter_posi}] (error: {json_data.get('error')}) {time_taken_s}")
                 return False
 
             download_url = "https:" + raw_url.replace("\\/", "/")
+
+            # if self.debug:
+            #     print(f"  [DEBUG] API response: {json_data}")
+            #     print(f"  [DEBUG] Download URL: {download_url}")
+
             parsed_url = urlparse(download_url)
             ext = Path(parsed_url.path).suffix
-            if ext not in ['.zip', '.cbr']: ext = '.cbr'
+            if ext not in ['.zip', '.cbr']:
+                ext = '.cbr'
             temp_archive_path = chapter_folder / f"__archive__{ext}"
-            archive_response = self.session.get(download_url, headers=self.headers, stream=True, timeout=60)
+
+            download_headers = self.headers.copy()
+            download_headers['Referer'] = manga_url
+            archive_response = self.session.get(download_url, headers=download_headers, stream=True, timeout=60)
+
+            # if self.debug:
+            #     print(f"  [DEBUG] Request headers: {dict(archive_response.request.headers)}")
+            #     print(f"  [DEBUG] Response status: {archive_response.status_code}")
+            #     print(f"  [DEBUG] Response headers: {dict(archive_response.headers)}")
+            #     print(f"  [DEBUG] Session cookies: {dict(self.session.cookies)}")
 
             if archive_response.status_code == 200:
                 with open(temp_archive_path, 'wb') as f:
@@ -293,46 +340,63 @@ class ComXLifeDownloader:
                         extracted = True
                     except Exception:
                         time_taken_s = f"({time.time() - start_time:.2f} сек)"
-                        print(f"\r  ✗ Ошибка распаковки: {chapter_title_safe} (не ZIP и не RAR) {time_taken_s}")
+                        if self.debug:
+                            print(f"  ✗ Ошибка распаковки: {chapter_title_safe} (не ZIP и не RAR) {time_taken_s}")
+                        else:
+                            print(f"\r  ✗ Ошибка распаковки: {chapter_title_safe} (не ZIP и не RAR) {time_taken_s}")
                         return False
                 except Exception:
                     time_taken_s = f"({time.time() - start_time:.2f} сек)"
-                    print(f"\r  ✗ Ошибка распаковки (ZIP): {chapter_title_safe} {time_taken_s}")
+                    if self.debug:
+                        print(f"  ✗ Ошибка распаковки (ZIP): {chapter_title_safe} {time_taken_s}")
+                    else:
+                        print(f"\r  ✗ Ошибка распаковки (ZIP): {chapter_title_safe} {time_taken_s}")
                     return False
                 finally:
                     if temp_archive_path.exists():
                         try:
                             temp_archive_path.unlink()
-                        except:
+                        except Exception:
                             pass
 
                 time_taken_s = f"({time.time() - start_time:.2f} сек)"
                 # Перезаписываем строку "Скачиваю..."
-                print(f"\r  ✓ {chapter_title_safe} {time_taken_s}{' ' * 20}")
+                if self.debug:
+                    print(f"  ✓ {chapter_title_safe} {time_taken_s}")
+                else:
+                    print(f"\r  ✓ {chapter_title_safe} {time_taken_s}{' ' * 20}")
                 return extracted
             else:
                 time_taken_s = f"({time.time() - start_time:.2f} сек)"
-                print(f"\r  ✗ Ошибка скачивания файла: {archive_response.status_code} {time_taken_s}")
+                if self.debug:
+                    print(f"  ✗ Ошибка скачивания файла: {archive_response.status_code} {time_taken_s}")
+                else:
+                    print(f"\r  ✗ Ошибка скачивания файла: {archive_response.status_code} {time_taken_s}")
                 return False
 
         except Exception as e:
             time_taken_s = f"({time.time() - start_time:.2f} сек)"
-            print(f"\r  ✗ Критическая ошибка: {chapter_title_safe} ({e}) {time_taken_s}")
+            if self.debug:
+                print(f"  ✗ Критическая ошибка: {chapter_title_safe} ({e}) {time_taken_s}")
+            else:
+                print(f"\r  ✗ Критическая ошибка: {chapter_title_safe} ({e}) {time_taken_s}")
             if temp_archive_path and temp_archive_path.exists():
                 try:
                     temp_archive_path.unlink()
-                except:
+                except Exception:
                     pass
             return False
 
-    def download_manga(self, manga_url, output_dir="manga", start_chapter=None, end_chapter=None):
+    def download_manga(self, manga_url, output_dir="manga", start_chapter=None, end_chapter=None,
+                        output_format=None, delete_sources=None, quiet=False):
         if not self.load_cookies():
             if not self.get_cookies_via_selenium():
                 print(f"\n{RED}✗ ОШИБКА: Не удалось авторизоваться{ENDC}")
                 return False
 
-        clear_console()
-        print_menu()
+        if not quiet:
+            clear_console()
+            print_menu()
         news_id = self.get_manga_id_from_url(manga_url)
         if not news_id:
             print(f"\n{RED}✗ Не удалось определить ID манги из URL{ENDC}")
@@ -384,6 +448,13 @@ class ComXLifeDownloader:
         print(f"✓ Успешно скачано: {success_count}/{len(chapters)} глав")
         print(f"🕒 Общее время: {total_time_taken:.2f} сек")
         print(f"📁 Сохранено в: {base_manga_folder.absolute()}\n")
+
+        if success_count > 0:
+            if output_format is not None:
+                self.process_output(base_manga_folder, manga_title, output_format, delete_sources)
+            else:
+                self.prompt_output_creation(base_manga_folder, manga_title)
+
         return True
 
     @staticmethod
@@ -417,6 +488,292 @@ class ComXLifeDownloader:
             except ValueError:
                 return None, None
 
+    @staticmethod
+    def parse_chapter_sort_key(folder_name):
+        """Extract volume/chapter numbers from folder name for sorting."""
+        # Pattern: "Vol. X Ch. Y - Title"
+        match = re.match(r'Vol\.\s*([\d.]+)\s*Ch\.\s*([\d.]+)', folder_name)
+        if match:
+            try:
+                vol = float(match.group(1))
+                ch = float(match.group(2))
+                return (vol, ch)
+            except ValueError:
+                pass
+
+        # Pattern: "Ch. X - Title"
+        match = re.match(r'Ch\.\s*([\d.]+)', folder_name)
+        if match:
+            try:
+                ch = float(match.group(1))
+                return (0, ch)
+            except ValueError:
+                pass
+
+        # Fallback: extract any number
+        numbers = re.findall(r'[\d.]+', folder_name)
+        if numbers:
+            try:
+                return (0, float(numbers[0]))
+            except ValueError:
+                pass
+
+        return (0, 0)
+
+    @staticmethod
+    def get_sorted_chapter_folders(manga_folder):
+        """Return chapter folders sorted by volume/chapter number."""
+        folders = [f for f in manga_folder.iterdir() if f.is_dir()]
+        folders.sort(key=lambda f: ComXLifeDownloader.parse_chapter_sort_key(f.name))
+        return folders
+
+    @staticmethod
+    def get_sorted_images(chapter_folder):
+        """Return image files sorted naturally (2.jpg before 10.jpg)."""
+        image_extensions = {'.jpg', '.jpeg', '.png', '.webp'}
+        images = [f for f in chapter_folder.iterdir()
+                  if f.is_file() and f.suffix.lower() in image_extensions]
+
+        def natural_sort_key(path):
+            # Extract numbers for natural sorting
+            parts = re.split(r'(\d+)', path.stem)
+            return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+        images.sort(key=natural_sort_key)
+        return images
+
+    @staticmethod
+    def convert_webp_to_jpeg(webp_path, temp_dir):
+        """Convert WebP image to JPEG for img2pdf compatibility."""
+        try:
+            img = Image.open(webp_path)
+            # Handle RGBA/alpha channel
+            if img.mode in ('RGBA', 'LA', 'P'):
+                # Create white background
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            jpeg_path = Path(temp_dir) / f"{webp_path.stem}.jpg"
+            img.save(jpeg_path, 'JPEG', quality=95)
+            return jpeg_path
+        except Exception as e:
+            print(f"    {YELLOW}⚠ Не удалось конвертировать {webp_path.name}: {e}{ENDC}")
+            return None
+
+    def create_pdf(self, manga_folder, output_pdf_path):
+        """Create PDF from all chapter images."""
+        print(f"\n{CYAN}📄 Создание PDF...{ENDC}")
+
+        chapter_folders = self.get_sorted_chapter_folders(manga_folder)
+        if not chapter_folders:
+            print(f"{RED}✗ Не найдено папок с главами{ENDC}")
+            return False
+
+        all_images = []
+        temp_dir = None
+
+        try:
+            # Collect all images
+            for folder in chapter_folders:
+                images = self.get_sorted_images(folder)
+                if not images:
+                    print(f"  {YELLOW}⚠ Пустая папка: {folder.name}{ENDC}")
+                    continue
+                all_images.extend(images)
+
+            if not all_images:
+                print(f"{RED}✗ Не найдено изображений для PDF{ENDC}")
+                return False
+
+            print(f"  Найдено {len(all_images)} изображений в {len(chapter_folders)} главах")
+
+            # Process images (convert WebP if needed)
+            temp_dir = tempfile.mkdtemp()
+            image_paths = []
+
+            for idx, img_path in enumerate(all_images):
+                # Show progress
+                progress = (idx + 1) / len(all_images) * 100
+                print(f"\r  Обработка: {progress:.0f}%", end="", flush=True)
+
+                if img_path.suffix.lower() == '.webp':
+                    converted = self.convert_webp_to_jpeg(img_path, temp_dir)
+                    if converted:
+                        image_paths.append(str(converted))
+                else:
+                    image_paths.append(str(img_path))
+
+            print("\r  Обработка: 100%   ")
+
+            if not image_paths:
+                print(f"{RED}✗ Нет изображений для включения в PDF{ENDC}")
+                return False
+
+            # Create PDF
+            print("  Генерация PDF...")
+            with open(output_pdf_path, 'wb') as f:
+                f.write(img2pdf.convert(image_paths))
+
+            # Report file size
+            file_size = output_pdf_path.stat().st_size
+            if file_size >= 1024 * 1024 * 1024:
+                size_str = f"{file_size / (1024 * 1024 * 1024):.2f} ГБ"
+            elif file_size >= 1024 * 1024:
+                size_str = f"{file_size / (1024 * 1024):.2f} МБ"
+            else:
+                size_str = f"{file_size / 1024:.2f} КБ"
+
+            print(f"{GREEN}✓ PDF создан: {output_pdf_path} ({size_str}){ENDC}")
+            return True
+
+        except KeyboardInterrupt:
+            print(f"\n{YELLOW}⚠ Создание PDF прервано{ENDC}")
+            if output_pdf_path.exists():
+                output_pdf_path.unlink()
+            return False
+        except Exception as e:
+            print(f"{RED}✗ Ошибка создания PDF: {e}{ENDC}")
+            return False
+        finally:
+            # Clean up temp directory
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def delete_manga_folder(self, manga_folder):
+        """Delete the entire manga folder with all images."""
+        try:
+            shutil.rmtree(manga_folder)
+            print(f"✓ Удалена папка: {manga_folder.name}")
+        except Exception as e:
+            print(f"  {YELLOW}⚠ Не удалось удалить {manga_folder.name}: {e}{ENDC}")
+
+    def create_cbz(self, manga_folder, output_cbz_path):
+        """Create CBZ (Comic Book ZIP) from all chapter images."""
+        print(f"\n{CYAN}📦 Создание CBZ...{ENDC}")
+
+        chapter_folders = self.get_sorted_chapter_folders(manga_folder)
+        if not chapter_folders:
+            print(f"{RED}✗ Не найдено папок с главами{ENDC}")
+            return False
+
+        try:
+            total_images = 0
+            for folder in chapter_folders:
+                total_images += len(self.get_sorted_images(folder))
+
+            if total_images == 0:
+                print(f"{RED}✗ Не найдено изображений для CBZ{ENDC}")
+                return False
+
+            print(f"  Найдено {total_images} изображений в {len(chapter_folders)} главах")
+
+            processed = 0
+            with zipfile.ZipFile(output_cbz_path, 'w', zipfile.ZIP_STORED) as zf:
+                for ch_idx, folder in enumerate(chapter_folders):
+                    chapter_num = f"{ch_idx + 1:03d}"
+                    images = self.get_sorted_images(folder)
+
+                    for img_idx, img_path in enumerate(images):
+                        processed += 1
+                        progress = processed / total_images * 100
+                        print(f"\r  Упаковка: {progress:.0f}%", end="", flush=True)
+
+                        arcname = f"{chapter_num}/{img_idx + 1:03d}{img_path.suffix.lower()}"
+                        zf.write(img_path, arcname)
+
+            print("\r  Упаковка: 100%   ")
+
+            # Report file size
+            file_size = output_cbz_path.stat().st_size
+            if file_size >= 1024 * 1024 * 1024:
+                size_str = f"{file_size / (1024 * 1024 * 1024):.2f} ГБ"
+            elif file_size >= 1024 * 1024:
+                size_str = f"{file_size / (1024 * 1024):.2f} МБ"
+            else:
+                size_str = f"{file_size / 1024:.2f} КБ"
+
+            print(f"{GREEN}✓ CBZ создан: {output_cbz_path} ({size_str}){ENDC}")
+            return True
+
+        except KeyboardInterrupt:
+            print(f"\n{YELLOW}⚠ Создание CBZ прервано{ENDC}")
+            if output_cbz_path.exists():
+                output_cbz_path.unlink()
+            return False
+        except Exception as e:
+            print(f"{RED}✗ Ошибка создания CBZ: {e}{ENDC}")
+            return False
+
+    def prompt_output_creation(self, manga_folder, manga_title):
+        """Ask user which output format to create and optionally delete originals."""
+        try:
+            questions = [
+                inquirer.List('format',
+                              message="📦 Выберите формат для сохранения",
+                              choices=[
+                                  ('CBZ (рекомендуется)', 'cbz'),
+                                  ('PDF', 'pdf'),
+                                  ('Не создавать', 'skip'),
+                              ],
+                              carousel=True),
+            ]
+            answers = inquirer.prompt(questions)
+
+            if not answers or answers['format'] == 'skip':
+                return
+
+            output_path = manga_folder.parent / f"{manga_title}.{answers['format']}"
+
+            if answers['format'] == 'cbz':
+                success = self.create_cbz(manga_folder, output_path)
+            else:
+                success = self.create_pdf(manga_folder, output_path)
+
+            if not success:
+                return
+
+            # Ask about deleting originals
+            questions = [
+                inquirer.Confirm('delete_originals',
+                                 message="🗑  Удалить исходные изображения?",
+                                 default=False),
+            ]
+            answers = inquirer.prompt(questions)
+
+            if answers and answers['delete_originals']:
+                self.delete_manga_folder(manga_folder)
+
+        except KeyboardInterrupt:
+            print(f"\n{YELLOW}⚠ Отменено{ENDC}")
+
+    def process_output(self, manga_folder, manga_title, output_format, delete_sources):
+        """Non-interactive output creation for batch mode."""
+        if output_format == "none":
+            return
+        output_path = manga_folder.parent / f"{manga_title}.{output_format}"
+        if output_format == "cbz":
+            success = self.create_cbz(manga_folder, output_path)
+        else:
+            success = self.create_pdf(manga_folder, output_path)
+        if success and delete_sources:
+            self.delete_manga_folder(manga_folder)
+
+def save_batch_file(filepath, urls, settings):
+    """Write/update batch JSON file."""
+    data = {"urls": urls, "settings": settings}
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_batch_file(filepath):
+    """Read and return batch data from JSON file."""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
 def main():
     if sys.version_info < (3, 7):
         print(f"{RED}✗ Ошибка: Этот скрипт требует Python 3.7+.{ENDC}")
@@ -437,86 +794,222 @@ def main():
             raise KeyboardInterrupt
 
         browser_name = answers['browser'].lower()
-        downloader = ComXLifeDownloader(browser_choice=browser_name)
+        downloader = ComXLifeDownloader(browser_choice=browser_name, debug=True)
 
         while True:
             clear_console()
             print_menu()
 
-            questions = [
-                inquirer.Text('query',
-                              message="📖 Введите URL или Название манги (Enter для выхода)"),
-            ]
-            answers = inquirer.prompt(questions)
+            input_str = input(f"{CYAN}📖 Введите URL, название манги или путь к batch .json (Enter для выхода): {ENDC}").strip()
 
-            if not answers or not answers['query']:
+            if not input_str:
                 raise KeyboardInterrupt
 
-            input_str = answers['query'].strip()
-            manga_url = None
-
-            if 'com-x.life' in input_str and 'http' in input_str:
-                manga_url = input_str
-            else:
-                clear_console()
-                print_menu()
-                print(f"\n{YELLOW}🔍 Ищу '{input_str}'...{ENDC}")
-                results = downloader.fetch_search_results_sync(input_str)
-
-                clear_console()
-                print_menu()
-
-                if not results:
-                    print(f"{RED}✗ Ничего не найдено по запросу '{input_str}'.{ENDC}")
-                    time.sleep(2)
-                    continue
-
-                if len(results) == 1:
-                    manga_url = results[0]['url']
-                    print(f"✓ Найдена 1 манга: {results[0]['title']}")
-                else:
-                    print(f"\n{YELLOW}📚 Найдено {len(results)} результатов. Выберите:{ENDC}")
-                    for i, res in enumerate(results, 1):
-                        print(f"  {i:02d}: {res['title']}")
-
-                    print(f"\n{GREY}(Введите номер или нажмите Enter для нового поиска){ENDC}")
-                    choice_str = input(f"{CYAN}Выберите номер: {ENDC}").strip()
-
-                    if not choice_str:
-                        continue
-
-                    try:
-                        choice_idx = int(choice_str) - 1
-                        if 0 <= choice_idx < len(results):
-                            manga_url = results[choice_idx]['url']
-                            print(f"✓ Выбрано: {results[choice_idx]['title']}")
-                        else:
-                            print(f"{RED}✗ Неверный номер.{ENDC}")
-                            time.sleep(2)
-                            continue
-                    except ValueError:
-                        print(f"{RED}✗ Неверный ввод.{ENDC}")
+            # --- Path A: Resume existing batch JSON ---
+            if input_str.endswith('.json') and Path(input_str).is_file():
+                try:
+                    batch_data = load_batch_file(input_str)
+                    batch_urls = batch_data["urls"]
+                    settings = batch_data["settings"]
+                    pending = [u for u in batch_urls if u["status"] != "done"]
+                    if not pending:
+                        print(f"{GREEN}✓ Все URL в этом батче уже обработаны.{ENDC}")
                         time.sleep(2)
                         continue
+                    print(f"\n{YELLOW}📋 Возобновление батча: {len(pending)} из {len(batch_urls)} ожидают скачивания{ENDC}")
+                    output_dir = settings.get("output_dir", "Manga")
+                    range_str = settings.get("chapters", "")
+                    start_chapter, end_chapter = ComXLifeDownloader.parse_range(range_str)
+                    output_format = settings.get("format", "none")
+                    delete_sources = settings.get("delete_sources", False)
+                    batch_filepath = Path(input_str)
+
+                    done_count = 0
+                    fail_count = 0
+                    for entry in batch_urls:
+                        if entry["status"] == "done":
+                            continue
+                        print(f"\n{CYAN}{BOLD}▶ [{done_count + fail_count + 1}/{len(pending)}] {entry['url']}{ENDC}")
+                        try:
+                            ok = downloader.download_manga(
+                                entry["url"], output_dir, start_chapter, end_chapter,
+                                output_format=output_format, delete_sources=delete_sources, quiet=True
+                            )
+                            if ok:
+                                entry["status"] = "done"
+                                done_count += 1
+                            else:
+                                fail_count += 1
+                        except KeyboardInterrupt:
+                            print(f"\n{YELLOW}⚠ Батч прерван пользователем{ENDC}")
+                            save_batch_file(batch_filepath, batch_urls, settings)
+                            break
+                        save_batch_file(batch_filepath, batch_urls, settings)
+
+                    print(SEPARATOR)
+                    print(f"{GREEN}{BOLD}ИТОГИ БАТЧА{ENDC}")
+                    print(SEPARATOR)
+                    print(f"  ✓ Успешно: {done_count}")
+                    if fail_count:
+                        print(f"  ✗ Ошибки: {fail_count}")
+                    remaining = sum(1 for u in batch_urls if u["status"] != "done")
+                    if remaining:
+                        print(f"  ⏳ Осталось: {remaining}")
+                    print(f"  📄 Батч-файл: {batch_filepath}")
+
+                except Exception as e:
+                    print(f"{RED}✗ Ошибка чтения батч-файла: {e}{ENDC}")
+                    time.sleep(2)
+
+                print(f"\n{CYAN}Нажмите Enter, чтобы продолжить...{ENDC}")
+                input()
+                continue
+
+            # --- Path B: URL → build batch list ---
+            if 'com-x.life' in input_str and 'http' in input_str:
+                batch_urls_list = [input_str]
+                print(f"\n{GREEN}  1. {input_str}{ENDC}")
+
+                while True:
+                    next_input = input(f"{CYAN}📖 Добавьте ещё URL или 'y' для начала скачивания: {ENDC}").strip()
+                    if next_input.lower() == 'y':
+                        break
+                    if 'com-x.life' in next_input and 'http' in next_input:
+                        batch_urls_list.append(next_input)
+                        print(f"{GREEN}  {len(batch_urls_list)}. {next_input}{ENDC}")
+                    elif not next_input:
+                        continue
+                    else:
+                        print(f"{YELLOW}⚠ Введите URL com-x.life или 'y' для старта{ENDC}")
+
+                # Collect settings once
+                output_dir = input(f"{CYAN}📁 Папка для сохранения [Manga]: {ENDC}").strip() or 'Manga'
+                range_str = input(f"{CYAN}💡 Укажите диапазон глав (Enter = все): {ENDC}").strip()
+                start_chapter, end_chapter = ComXLifeDownloader.parse_range(range_str)
+
+                fmt_questions = [
+                    inquirer.List('format',
+                                  message="📦 Формат для всех манг",
+                                  choices=[
+                                      ('CBZ (рекомендуется)', 'cbz'),
+                                      ('PDF', 'pdf'),
+                                      ('Не создавать', 'none'),
+                                  ],
+                                  carousel=True),
+                ]
+                fmt_answers = inquirer.prompt(fmt_questions)
+                output_format = fmt_answers['format'] if fmt_answers else 'none'
+
+                delete_sources = False
+                if output_format != 'none':
+                    del_questions = [
+                        inquirer.Confirm('delete_sources',
+                                         message="🗑  Удалить исходные изображения после создания?",
+                                         default=False),
+                    ]
+                    del_answers = inquirer.prompt(del_questions)
+                    delete_sources = del_answers['delete_sources'] if del_answers else False
+
+                # Build batch tracking data
+                batch_entries = [{"url": u, "status": "pending"} for u in batch_urls_list]
+                settings = {
+                    "output_dir": output_dir,
+                    "chapters": range_str,
+                    "format": output_format,
+                    "delete_sources": delete_sources,
+                }
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                batch_filepath = Path(output_dir) / f"batch_{timestamp}.json"
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
+                save_batch_file(batch_filepath, batch_entries, settings)
+                print(f"\n{GREY}📄 Батч-файл: {batch_filepath}{ENDC}")
+
+                # Process each URL
+                done_count = 0
+                fail_count = 0
+                for idx, entry in enumerate(batch_entries):
+                    print(f"\n{CYAN}{BOLD}▶ [{idx + 1}/{len(batch_entries)}] {entry['url']}{ENDC}")
+                    try:
+                        ok = downloader.download_manga(
+                            entry["url"], output_dir, start_chapter, end_chapter,
+                            output_format=output_format, delete_sources=delete_sources, quiet=True
+                        )
+                        if ok:
+                            entry["status"] = "done"
+                            done_count += 1
+                        else:
+                            fail_count += 1
+                    except KeyboardInterrupt:
+                        print(f"\n{YELLOW}⚠ Батч прерван пользователем{ENDC}")
+                        save_batch_file(batch_filepath, batch_entries, settings)
+                        break
+                    save_batch_file(batch_filepath, batch_entries, settings)
+
+                # Summary
+                print(SEPARATOR)
+                print(f"{GREEN}{BOLD}ИТОГИ БАТЧА{ENDC}")
+                print(SEPARATOR)
+                print(f"  ✓ Успешно: {done_count}")
+                if fail_count:
+                    print(f"  ✗ Ошибки: {fail_count}")
+                remaining = sum(1 for e in batch_entries if e["status"] != "done")
+                if remaining:
+                    print(f"  ⏳ Осталось: {remaining}")
+                print(f"  📄 Батч-файл: {batch_filepath}")
+
+                print(f"\n{CYAN}Нажмите Enter, чтобы продолжить...{ENDC}")
+                input()
+                continue
+
+            # --- Path D: Search query (unchanged) ---
+            manga_url = None
+            clear_console()
+            print_menu()
+            print(f"\n{YELLOW}🔍 Ищу '{input_str}'...{ENDC}")
+            results = downloader.fetch_search_results_sync(input_str)
+
+            clear_console()
+            print_menu()
+
+            if not results:
+                print(f"{RED}✗ Ничего не найдено по запросу '{input_str}'.{ENDC}")
+                time.sleep(2)
+                continue
+
+            if len(results) == 1:
+                manga_url = results[0]['url']
+                print(f"✓ Найдена 1 манга: {results[0]['title']}")
+            else:
+                print(f"\n{YELLOW}📚 Найдено {len(results)} результатов. Выберите:{ENDC}")
+                for i, res in enumerate(results, 1):
+                    print(f"  {i:02d}: {res['title']}")
+
+                print(f"\n{GREY}(Введите номер или нажмите Enter для нового поиска){ENDC}")
+                choice_str = input(f"{CYAN}Выберите номер: {ENDC}").strip()
+
+                if not choice_str:
+                    continue
+
+                try:
+                    choice_idx = int(choice_str) - 1
+                    if 0 <= choice_idx < len(results):
+                        manga_url = results[choice_idx]['url']
+                        print(f"✓ Выбрано: {results[choice_idx]['title']}")
+                    else:
+                        print(f"{RED}✗ Неверный номер.{ENDC}")
+                        time.sleep(2)
+                        continue
+                except ValueError:
+                    print(f"{RED}✗ Неверный ввод.{ENDC}")
+                    time.sleep(2)
+                    continue
 
             if not manga_url:
                  continue
 
-            questions = [
-                inquirer.Text('output',
-                              message="📁 Папка для сохранения",
-                              default='Manga'),
-                inquirer.Text('range',
-                              message="💡 Укажите диапазон (Enter = все)",
-                              default=''),
-            ]
-            answers = inquirer.prompt(questions)
-
-            if not answers:
-                continue
-
-            output_dir = answers['output'].strip() or 'manga'
-            start_chapter, end_chapter = ComXLifeDownloader.parse_range(answers['range'])
+            output_dir = input(f"{CYAN}📁 Папка для сохранения [Manga]: {ENDC}").strip() or 'Manga'
+            range_str = input(f"{CYAN}💡 Укажите диапазон (Enter = все): {ENDC}").strip()
+            start_chapter, end_chapter = ComXLifeDownloader.parse_range(range_str)
 
             downloader.download_manga(manga_url, output_dir, start_chapter, end_chapter)
 
