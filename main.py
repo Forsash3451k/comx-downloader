@@ -6,7 +6,6 @@ import re
 import cloudscraper
 import requests.cookies
 import zipfile
-import rarfile
 import inquirer
 import img2pdf
 import shutil
@@ -21,7 +20,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from webdriver_manager.firefox import GeckoDriverManager
-from urllib.parse import urljoin, urlparse, quote
+from urllib.parse import urljoin, quote
 
 # --- Цвета и Стили ---
 CYAN = '\033[96m'
@@ -46,7 +45,7 @@ def clear_console():
 
 def print_menu():
     title = f"{MAGENTA_BG}{BLACK_FG}{BOLD} COM-X.LIFE Downloader{ENDC}"
-    author = f"{BOLD}Автор: https://github.com/smutchev{ENDC}"
+    author = f"{BOLD}Fork: https://github.com/Forsash3451k/comx-downloader{ENDC}"
     print(f"\n{title}  {author}\n")
 
 class ComXLifeDownloader:
@@ -339,7 +338,7 @@ class ComXLifeDownloader:
                     progress = f"{idx}/{total}"
                     print(f"\r  🔗 {chapter_title_safe} [{progress}]", end="", flush=True)
 
-                for try_host in (current_host, host_ru):
+                for try_host in dict.fromkeys((current_host, host, host_ru)):
                     img_url = f"https://{try_host}/comix/{img_path}"
                     try:
                         img_resp = self.session.get(
@@ -347,7 +346,8 @@ class ComXLifeDownloader:
                             headers={**self.headers, 'Referer': reader_url},
                             timeout=30,
                         )
-                        if img_resp.status_code == 200 and len(img_resp.content) > 100:
+                        content_type = img_resp.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+                        if img_resp.status_code == 200 and content_type.startswith('image/'):
                             ext = Path(img_path).suffix.lower() or '.jpg'
                             filename = chapter_folder / f"{idx:03d}{ext}"
                             with open(filename, 'wb') as f:
@@ -367,17 +367,16 @@ class ComXLifeDownloader:
                 else:
                     print(f"\r  ✓ {chapter_title_safe} ({downloaded}/{total}){' ' * 20} {time_taken_s}")
                 return True
-            elif downloaded > 0:
-                if self.debug:
-                    print(f"  ⚠ {chapter_title_safe} ({downloaded}/{total} — часть не скачалась) {time_taken_s}")
-                else:
-                    print(f"\r  ⚠ {chapter_title_safe} ({downloaded}/{total}){' ' * 20} {time_taken_s}")
-                return True
             else:
+                msg = f"{downloaded}/{total} — неполная глава, папка удалена"
                 if self.debug:
-                    print(f"  ✗ {chapter_title_safe} (0/{total}) {time_taken_s}")
+                    print(f"  ✗ {chapter_title_safe} ({msg}) {time_taken_s}")
                 else:
-                    print(f"\r  ✗ {chapter_title_safe} (0/{total}){' ' * 20} {time_taken_s}")
+                    print(f"\r  ✗ {chapter_title_safe} ({msg}){' ' * 20} {time_taken_s}")
+                try:
+                    shutil.rmtree(chapter_folder, ignore_errors=True)
+                except Exception:
+                    pass
                 return False
 
         except Exception as e:
