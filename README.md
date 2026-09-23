@@ -218,7 +218,6 @@ Manga/
 - `beautifulsoup4` — парсинг HTML
 - `inquirer` — интерактивное меню
 - `webdriver-manager` — автоматическая установка драйверов
-- `rarfile` — работа с RAR-архивами
 - `img2pdf` + `Pillow` — упаковка в PDF, конвертация WebP
 - `cloudscraper` — обход Cloudflare
 

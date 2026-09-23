@@ -252,12 +252,14 @@ class ComXLifeDownloader:
 
         chapter_title_safe = self.sanitize_filename(chapter_name)
         chapter_folder = base_manga_folder / chapter_title_safe
+        completion_marker = chapter_folder / ".complete"
 
-        if chapter_folder.exists() and any(
-            f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp'] for f in chapter_folder.iterdir()
-        ):
+        if completion_marker.exists():
             print(f"  ⊘ {chapter_title_safe} (пропущено)")
             return True
+
+        if chapter_folder.exists():
+            shutil.rmtree(chapter_folder, ignore_errors=True)
 
         chapter_folder.mkdir(parents=True, exist_ok=True)
 
@@ -362,6 +364,7 @@ class ComXLifeDownloader:
 
             time_taken_s = f"({time.time() - start_time:.2f} сек)"
             if downloaded == total:
+                completion_marker.write_text(str(total), encoding='utf-8')
                 if self.debug:
                     print(f"  ✓ {chapter_title_safe} ({downloaded}/{total}) {time_taken_s}")
                 else:
@@ -385,7 +388,17 @@ class ComXLifeDownloader:
                 print(f"  ✗ Ошибка: {chapter_title_safe} ({e}) {time_taken_s}")
             else:
                 print(f"\r  ✗ Ошибка: {chapter_title_safe} ({e}){' ' * 20} {time_taken_s}")
+            try:
+                shutil.rmtree(chapter_folder, ignore_errors=True)
+            except Exception:
+                pass
             return False
+        except KeyboardInterrupt:
+            try:
+                shutil.rmtree(chapter_folder, ignore_errors=True)
+            except Exception:
+                pass
+            raise
 
     def download_manga(self, manga_url, output_dir="manga", start_chapter=None, end_chapter=None,
                         output_format=None, delete_sources=None, quiet=False):
